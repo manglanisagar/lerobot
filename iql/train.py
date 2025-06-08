@@ -9,6 +9,7 @@ import argparse
 import os
 from pathlib import Path
 from typing import List, Tuple, Dict
+import json
 
 import cv2
 import numpy as np
@@ -85,15 +86,22 @@ class LerobotDataset(Dataset):
             self.index.extend([(fi, ri) for ri in range(n_rows)])
 
         # Prompt
-        tasks_dir = self.root / "tasks"
-        task_txts = sorted(tasks_dir.glob("*.txt"))
         self.task_to_prompt: Dict[int, str] = {}
-        for p in task_txts:
-            try:
-                idx = int(p.stem.split("_")[-1]) if "_" in p.stem else int(p.stem)
-            except ValueError:
-                continue
-            self.task_to_prompt[idx] = p.read_text().strip()
+        tasks_jsonl = self.root / "meta" / "tasks.jsonl"
+        if tasks_jsonl.exists():
+            with open(tasks_jsonl) as f:
+                for line in f:
+                    item = json.loads(line)
+                    self.task_to_prompt[int(item["task_index"])] = item["task"].strip()
+        else:
+            tasks_dir = self.root / "tasks"
+            task_txts = sorted(tasks_dir.glob("*.txt"))
+            for p in task_txts:
+                try:
+                    idx = int(p.stem.split("_")[-1]) if "_" in p.stem else int(p.stem)
+                except ValueError:
+                    continue
+                self.task_to_prompt[idx] = p.read_text().strip()
         assert self.task_to_prompt, "No task prompt files found."
 
         # Text encoder (frozen) & cache

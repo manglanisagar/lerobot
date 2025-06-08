@@ -165,10 +165,15 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
         "index": np.array(episode_data["index"], dtype=np.int64).squeeze(),
     }
 
-    ep_stats = {
-        key: get_feature_stats(value, axis=0, keepdims=False)
-        for key, value in ep_stats_buffer.items()
-    }
+    ep_stats = {}
+    for key, value in ep_stats_buffer.items():
+        if key == "observation.images.perspective":
+            stats = get_feature_stats(value, axis=(0, 2, 3), keepdims=True)
+            stats = {k: v if k == "count" else np.squeeze(v, axis=0) for k, v in stats.items()}
+        else:
+            keepdims = value.ndim == 1
+            stats = get_feature_stats(value, axis=0, keepdims=keepdims)
+        ep_stats[key] = stats
 
     table = pa.Table.from_pydict(episode_data)
     ep_path = output_root / DEFAULT_PARQUET_PATH.format(
