@@ -1,11 +1,26 @@
 import os
-import pandas as pd
+from pathlib import Path
+import json
+
 import cv2
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
-import json
+
+from lerobot.common.datasets.compute_stats import get_feature_stats
+from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION
+from lerobot.common.datasets.utils import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_FEATURES,
+    DEFAULT_PARQUET_PATH,
+    create_empty_dataset_info,
+    write_episode,
+    write_episode_stats,
+    write_info,
+    write_task,
+)
 
 INPUT_DIR = "dataset"
 OUTPUT_DIR = "processed_dataset"
@@ -19,41 +34,38 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Load prompts
 prompt_df = pd.read_csv(PROMPTS_FILE).set_index("scene_index")
 
-metadata = {
-    "codebase_version": "v2.1",
-    "robot_type": "custom_quad",
-    "total_episodes": 0,
-    "total_frames": 0,
-    "fps": FPS,
-    "features": {
-        "observation.images.perspective": {
-            "dtype": "video",
-            "shape": [360, 640, 3],
-            "names": ["height", "width", "channels"]
-        },
-        "observation.state": {
-            "dtype": "float32",
-            "shape": [3],
-            "names": ["vx", "vy", "yaw"]
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": [3],
-            "names": ["vx", "vy", "omega"]
-        },
-        "language_instruction": {
-            "dtype": "string",
-            "shape": [1],
-            "names": None
-        },
-        "timestamp": {"dtype": "float32", "shape": [1]},
-        "frame_index": {"dtype": "int64", "shape": [1]},
-        "episode_index": {"dtype": "int64", "shape": [1]}
-    }
+features = {
+    "observation.images.perspective": {
+        "dtype": "image",
+        "shape": [360, 640, 3],
+        "names": ["height", "width", "channels"],
+    },
+    "observation.state": {
+        "dtype": "float32",
+        "shape": [3],
+        "names": ["vx", "vy", "yaw"],
+    },
+    "action": {
+        "dtype": "float32",
+        "shape": [3],
+        "names": ["vx", "vy", "omega"],
+    },
 }
+features = {**features, **DEFAULT_FEATURES}
 
+metadata = create_empty_dataset_info(
+    CODEBASE_VERSION,
+    FPS,
+    features,
+    use_videos=False,
+    robot_type="custom_quad",
+)
+
+output_root = Path(OUTPUT_DIR)
 episode_count = 0
 frame_count = 0
+global_index = 0
+tasks_to_index: dict[str, int] = {}
 
 for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
     scene_path = os.path.join(INPUT_DIR, scene)
@@ -71,15 +83,27 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
     vel_df = pd.read_csv(os.path.join(scene_path, "velocity.csv"))
     cmd_df = pd.read_csv(os.path.join(scene_path, "commands.csv"))
 
+    if prompt not in tasks_to_index:
+        task_idx = len(tasks_to_index)
+        tasks_to_index[prompt] = task_idx
+        write_task(task_idx, prompt, output_root)
+    else:
+        task_idx = tasks_to_index[prompt]
+
     episode_data = {
         "observation.images.perspective": [],
         "observation.state": [],
         "action": [],
-        "language_instruction": [],
         "timestamp": [],
         "frame_index": [],
-        "episode_index": []
+        "episode_index": [],
+        "task_index": [],
+        "index": [],
     }
+
+    images_for_stats = []
+    states_for_stats = []
+    actions_for_stats = []
 
     for i in KEEP_RANGE:
         img_path = os.path.join(scene_path, f"rgb_{i:04d}.png")
@@ -87,6 +111,7 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
         img = cv2.resize(img, IMAGE_SIZE)
         img = img[..., ::-1]  # Convert BGR to RGB
         episode_data["observation.images.perspective"].append(img)
+        images_for_stats.append(img.transpose(2, 0, 1))
 
         obs_row = vel_df.iloc[i]
         cmd_row = cmd_df.iloc[i]
@@ -96,28 +121,62 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
 
         episode_data["observation.state"].append(state)
         episode_data["action"].append(action)
-        episode_data["language_instruction"].append([prompt])
+        states_for_stats.append(state)
+        actions_for_stats.append(action)
         episode_data["timestamp"].append([obs_row["time"]])
         episode_data["frame_index"].append([i])
         episode_data["episode_index"].append([episode_count])
+        episode_data["task_index"].append([task_idx])
+        episode_data["index"].append([global_index])
+        global_index += 1
 
     episode_data["observation.images.perspective"] = [
-        cv2.imencode('.jpg', img)[1].tobytes()
+        cv2.imencode(".jpg", img)[1].tobytes()
         for img in episode_data["observation.images.perspective"]
     ]
 
+    # Compute episode statistics
+    ep_stats_buffer = {
+        "observation.images.perspective": np.stack(images_for_stats).astype(np.float32) / 255.0,
+        "observation.state": np.stack(states_for_stats).astype(np.float32),
+        "action": np.stack(actions_for_stats).astype(np.float32),
+        "timestamp": np.array(episode_data["timestamp"], dtype=np.float32).squeeze(),
+        "frame_index": np.array(episode_data["frame_index"], dtype=np.int64).squeeze(),
+        "episode_index": np.array(episode_data["episode_index"], dtype=np.int64).squeeze(),
+        "task_index": np.array(episode_data["task_index"], dtype=np.int64).squeeze(),
+        "index": np.array(episode_data["index"], dtype=np.int64).squeeze(),
+    }
+
+    ep_stats = {
+        key: get_feature_stats(value, axis=(0, 2, 3) if key == "observation.images.perspective" else 0, keepdims=key == "observation.images.perspective")
+        for key, value in ep_stats_buffer.items()
+    }
+    ep_stats["observation.images.perspective"] = {
+        k: v if k == "count" else np.squeeze(v, axis=0)
+        for k, v in ep_stats["observation.images.perspective"].items()
+    }
+
     table = pa.Table.from_pydict(episode_data)
-    pq.write_table(
-        table,
-        os.path.join(OUTPUT_DIR, f"episode_{episode_count:06d}.parquet")
+    ep_path = output_root / DEFAULT_PARQUET_PATH.format(
+        episode_chunk=episode_count // DEFAULT_CHUNK_SIZE,
+        episode_index=episode_count,
     )
+    ep_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, ep_path)
+
+    write_episode(
+        {"episode_index": episode_count, "tasks": [prompt], "length": len(KEEP_RANGE)},
+        output_root,
+    )
+    write_episode_stats(episode_count, ep_stats, output_root)
 
     frame_count += len(episode_data["frame_index"])
     episode_count += 1
 
 metadata["total_episodes"] = episode_count
 metadata["total_frames"] = frame_count
+metadata["total_tasks"] = len(tasks_to_index)
+metadata["total_chunks"] = (episode_count - 1) // DEFAULT_CHUNK_SIZE + 1
 
-with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
-    json.dump(metadata, f, indent=2)
+write_info(metadata, output_root)
 
