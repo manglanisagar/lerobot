@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+python train.py \
+    --data-root ../quad_data/reward_dataset \
+    --epochs 200 --batch 512
+"""
+
+import argparse
+import os
+from pathlib import Path
+from typing import List, Tuple, Dict
+
+import cv2
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+
+# Helpers
+
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = self.avg = self.sum = self.count = 0.0
+
+    def update(self, v, n=1):
+        self.val = v
+        self.sum += v * n
+        self.count += n
+        self.avg = self.sum / self.count if self.count else 0.0
+
+# Dataset 
+
+def _discover_episode_files(root: Path) -> List[Path]:
+    """Return all episode parquet files under the dataset root."""
+    return sorted(root.glob("**/episode_*.parquet"))
+
+class LerobotDataset(Dataset):
+    """Streams transitions from LeRobot parquet episodes."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        image_size: int = 128,
+        qvel_dim: int = 3,
+        text_model: str = "all-MiniLM-L6-v2",
+    ):
+        self.root = Path(root)
+        self.files: List[Path] = _discover_episode_files(self.root)
+        assert self.files, f"No episode parquet files found in {root}"
+
+        # Build (file_idx, row_idx) index without loading data
+        self.file_meta: List[Tuple[Path, int]] = []  # (path, n_rows)
+        self.index: List[Tuple[int, int]] = []  # maps global_idx → (file_i, row_i)
+        for fi, fp in enumerate(self.files):
+            n_rows = pq.ParquetFile(fp).metadata.num_rows
+            self.file_meta.append((fp, n_rows))
+            self.index.extend([(fi, ri) for ri in range(n_rows)])
+
+        # Prompt
+        tasks_dir = self.root / "tasks"
+        task_txts = sorted(tasks_dir.glob("*.txt"))
+        self.task_to_prompt: Dict[int, str] = {}
+        for p in task_txts:
+            try:
+                idx = int(p.stem.split("_")[-1]) if "_" in p.stem else int(p.stem)
+            except ValueError:
+                continue
+            self.task_to_prompt[idx] = p.read_text().strip()
+        assert self.task_to_prompt, "No task prompt files found."
+
+        # Text encoder (frozen) & cache
+        self.text_encoder = SentenceTransformer(text_model, device="cpu")
+        self.prompt_cache: Dict[int, torch.Tensor] = {}
+        for idx, prompt in self.task_to_prompt.items():
+            emb = self.text_encoder.encode(prompt, convert_to_numpy=True)
+            self.prompt_cache[idx] = torch.from_numpy(emb.astype(np.float32))
+
+        # Image transform
+        self.img_tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((image_size, image_size)),
+        ])
+
+        # Working cache: keep last loaded file as pandas DF to avoid thrashing
+        self._curr_file_idx: int | None = None
+        self._curr_df: pd.DataFrame | None = None
+
+        self.qvel_dim = qvel_dim
+
+    # Internal helpers
+
+    def _load_file(self, file_idx: int):
+        path = self.file_meta[file_idx][0]
+        self._curr_df = pq.read_table(path).to_pandas()
+        self._curr_file_idx = file_idx
+
+    def _get_row(self, file_idx: int, row_idx: int):
+        if file_idx != self._curr_file_idx or self._curr_df is None:
+            self._load_file(file_idx)
+        return self._curr_df.iloc[row_idx]
+
+    # PyTorch Dataset interface
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, global_idx):
+        file_idx, row_idx = self.index[global_idx]
+        row = self._get_row(file_idx, row_idx)
+
+        # Decode image
+        img_bytes = row["observation.images.perspective"]
+        img_np = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+        img = self.img_tf(img_rgb)
+
+        # Q velocity state
+        qvel_full = row["observation.state"]  # list-like length ≥ qvel_dim
+        qvel = torch.as_tensor(qvel_full[: self.qvel_dim], dtype=torch.float32)
+
+        # Action
+        act = torch.as_tensor(row["action"], dtype=torch.float32)
+
+        # Reward & done
+        rew = torch.as_tensor(row["next.reward"][0], dtype=torch.float32)
+        done_flag = bool(row["next.done"][0])
+        done = torch.as_tensor(float(done_flag))
+
+        # Prompt embedding
+        task_idx = int(row["task_index"]) if "task_index" in row else 0
+        prompt_emb = self.prompt_cache[task_idx]
+
+        # Current observation vector
+        obs = torch.cat([img.flatten(), qvel, prompt_emb], dim=0)
+
+        # Next observation (t+1)
+        if done_flag or row_idx + 1 >= self.file_meta[file_idx][1]:
+            next_obs = torch.zeros_like(obs)
+        else:
+            next_row = self._get_row(file_idx, row_idx + 1)
+            nxt_img_bytes = next_row["observation.images.perspective"]
+            nxt_np = cv2.imdecode(np.frombuffer(nxt_img_bytes, np.uint8), cv2.IMREAD_COLOR)
+            nxt_rgb = cv2.cvtColor(nxt_np, cv2.COLOR_BGR2RGB)
+            nxt_img = self.img_tf(nxt_rgb)
+            nxt_qvel = torch.as_tensor(next_row["observation.state"][: self.qvel_dim], dtype=torch.float32)
+            next_obs = torch.cat([nxt_img.flatten(), nxt_qvel, prompt_emb], dim=0)
+
+        return obs, act, rew, next_obs, done
+
+# Networks
+
+class Policy(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.mu = nn.Linear(hidden, act_dim)
+        self.log_std = nn.Linear(hidden, act_dim)
+
+    def forward(self, obs):
+        h = self.net(obs)
+        mu = self.mu(h)
+        log_std = torch.clamp(self.log_std(h), -5, 2)
+        std = torch.exp(log_std)
+        return mu, std
+
+class QFunction(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, obs, act):
+        return self.net(torch.cat([obs, act], dim=-1)).squeeze(-1)
+
+class ValueFunction(nn.Module):
+    def __init__(self, obs_dim: int, hidden: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, obs):
+        return self.net(obs).squeeze(-1)
+
+# IQL Agent
+
+class IQLAgent:
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden: int = 1024,
+        expectile: float = 0.7,
+        temperature: float = 3.0,
+        gamma: float = 0.99,
+        lr: float = 3e-4,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ):
+        self.device = device
+        self.expectile = expectile
+        self.temperature = temperature
+        self.gamma = gamma
+
+        self.pi = Policy(obs_dim, act_dim, hidden).to(device)
+        self.q1 = QFunction(obs_dim, act_dim, hidden).to(device)
+        self.q2 = QFunction(obs_dim, act_dim, hidden).to(device)
+        self.v = ValueFunction(obs_dim, hidden).to(device)
+        self.tq1 = QFunction(obs_dim, act_dim, hidden).to(device)
+        self.tq2 = QFunction(obs_dim, act_dim, hidden).to(device)
+        self._update_target(1.0)
+
+        self.opt_q = optim.Adam([*self.q1.parameters(), *self.q2.parameters()], lr=lr)
+        self.opt_v = optim.Adam(self.v.parameters(), lr=lr)
+        self.opt_pi = optim.Adam(self.pi.parameters(), lr=lr)
+
+    def _update_target(self, tau=0.005):
+        for tgt, src in zip(self.tq1.parameters(), self.q1.parameters()):
+            tgt.data.mul_(1 - tau).add_(tau * src.data)
+        for tgt, src in zip(self.tq2.parameters(), self.q2.parameters()):
+            tgt.data.mul_(1 - tau).add_(tau * src.data)
+
+    def _expectile_loss(self, diff):
+        w = torch.where(diff > 0, self.expectile, 1 - self.expectile)
+        return (w * diff.pow(2)).mean()
+
+    def update(self, batch):
+        obs, act, rew, next_obs, done = [b.to(self.device) for b in batch]
+
+        with torch.no_grad():
+            target_v = self.v(next_obs)
+            target_q = rew + self.gamma * (1 - done) * target_v
+
+        # Q update
+        q1_pred, q2_pred = self.q1(obs, act), self.q2(obs, act)
+        q_loss = (q1_pred - target_q).pow(2).mean() + (q2_pred - target_q).pow(2).mean()
+        self.opt_q.zero_grad(); q_loss.backward(); self.opt_q.step()
+
+        # V update
+        with torch.no_grad():
+            q_min = torch.minimum(q1_pred, q2_pred)
+        v_pred = self.v(obs)
+        v_loss = self._expectile_loss(q_min - v_pred)
+        self.opt_v.zero_grad(); v_loss
+
+        # Policy update (adv‑weighted BC)
+        with torch.no_grad():
+            adv = q_min - v_pred
+            weights = torch.exp(adv / self.temperature).clamp(max=100.0)
+        mu, std = self.pi(obs)
+        dist = torch.distributions.Normal(mu, std)
+        log_prob = dist.log_prob(act).sum(-1)
+        pi_loss = -(weights * log_prob).mean()
+        self.opt_pi.zero_grad(); pi_loss.backward(); self.opt_pi.step()
+
+        # Target network update
+        self._soft_update(self.tq1, self.q1, 0.005)
+        self._soft_update(self.tq2, self.q2, 0.005)
+
+        return {"q": q_loss.item(), "v": v_loss.item(), "pi": pi_loss.item()}
+
+# Training loop 
+
+def train(cfg):
+    ds = LerobotDataset(
+        cfg.data_root,
+        image_size=cfg.image_size,
+        qvel_dim=cfg.qvel_dim,
+        text_model=cfg.text_model,
+    )
+    dl = DataLoader(ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, pin_memory=True)
+
+    obs_dim = ds[0][0].numel()
+    act_dim = ds[0][1].numel()
+    agent = IQLAgent(
+        obs_dim, act_dim,
+        hidden=cfg.hidden,
+        expectile=cfg.expectile,
+        temperature=cfg.temperature,
+        gamma=cfg.gamma,
+        lr=cfg.lr,
+        device=cfg.device,
+    )
+
+    for ep in range(1, cfg.epochs + 1):
+        meters = {k: AverageMeter() for k in ("q", "v", "pi")}
+        for batch in tqdm(dl, desc=f"Epoch {ep}"):
+            stats = agent.update(batch)
+            for k, v in stats.items(): meters[k].update(v, n=batch[0].size(0))
+        print(" | ".join([f"{k}:{m.avg:.4f}" for k, m in meters.items()]))
+
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    torch.save({
+        "policy": agent.pi.state_dict(),
+        "q1": agent.q1.state
+
