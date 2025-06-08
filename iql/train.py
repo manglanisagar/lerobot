@@ -153,10 +153,11 @@ class LerobotDataset(Dataset):
 
         # Q velocity state
         qvel_full = row["observation.state"]  # list-like length ≥ qvel_dim
-        qvel = torch.as_tensor(qvel_full[: self.qvel_dim], dtype=torch.float32)
+        qvel_np = np.array(qvel_full[: self.qvel_dim], dtype=np.float32, copy=True)
+        qvel = torch.from_numpy(qvel_np)
 
         # Action
-        act = torch.as_tensor(row["action"], dtype=torch.float32)
+        act = torch.from_numpy(np.array(row["action"], dtype=np.float32, copy=True))
 
         # Reward & done
         rew = torch.as_tensor(row["next.reward"][0], dtype=torch.float32)
@@ -179,7 +180,7 @@ class LerobotDataset(Dataset):
             nxt_np = cv2.imdecode(np.frombuffer(nxt_img_bytes, np.uint8), cv2.IMREAD_COLOR)
             nxt_rgb = cv2.cvtColor(nxt_np, cv2.COLOR_BGR2RGB)
             nxt_img = self.img_tf(nxt_rgb)
-            nxt_qvel = torch.as_tensor(next_row["observation.state"][: self.qvel_dim], dtype=torch.float32)
+            nxt_qvel = torch.from_numpy(np.array(next_row["observation.state"][: self.qvel_dim], dtype=np.float32, copy=True))
             next_obs = torch.cat([nxt_img.flatten(), nxt_qvel, prompt_emb], dim=0)
 
         return obs, act, rew, next_obs, done
