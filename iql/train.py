@@ -18,7 +18,8 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
@@ -272,6 +273,28 @@ class IQLAgent:
         w = torch.where(diff > 0, self.expectile, 1 - self.expectile)
         return (w * diff.pow(2)).mean()
 
+    def compute_losses(self, batch):
+        with torch.no_grad():
+            obs, act, rew, next_obs, done = [b.to(self.device) for b in batch]
+            target_v = self.v(next_obs)
+            target_q = rew + self.gamma * (1 - done) * target_v
+
+            q1_pred, q2_pred = self.q1(obs, act), self.q2(obs, act)
+            q_loss = (q1_pred - target_q).pow(2).mean() + (q2_pred - target_q).pow(2).mean()
+
+            q_min = torch.minimum(q1_pred, q2_pred)
+            v_pred = self.v(obs)
+            v_loss = self._expectile_loss(q_min - v_pred)
+
+            adv = q_min - v_pred
+            weights = torch.exp(adv / self.temperature).clamp(max=100.0)
+            mu, std = self.pi(obs)
+            dist = torch.distributions.Normal(mu, std)
+            log_prob = dist.log_prob(act).sum(-1)
+            pi_loss = -(weights * log_prob).mean()
+
+        return {"q": q_loss.item(), "v": v_loss.item(), "pi": pi_loss.item()}
+
     def update(self, batch):
         obs, act, rew, next_obs, done = [b.to(self.device) for b in batch]
 
@@ -316,7 +339,13 @@ def train(cfg):
         qvel_dim=cfg.qvel_dim,
         text_model=cfg.text_model,
     )
-    dl = DataLoader(ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, pin_memory=True)
+
+    val_len = max(1, int(0.1 * len(ds)))
+    train_len = len(ds) - val_len
+    train_ds, val_ds = random_split(ds, [train_len, val_len])
+
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, pin_memory=True)
+    val_dl = DataLoader(val_ds, batch_size=cfg.batch, shuffle=False, num_workers=cfg.workers, pin_memory=True)
 
     obs_dim = ds[0][0].numel()
     act_dim = ds[0][1].numel()
@@ -330,12 +359,30 @@ def train(cfg):
         device=cfg.device,
     )
 
+    writer = SummaryWriter(cfg.out_dir)
+    step = 0
     for ep in range(1, cfg.epochs + 1):
-        meters = {k: AverageMeter() for k in ("q", "v", "pi")}
-        for batch in tqdm(dl, desc=f"Epoch {ep}"):
+        train_m = {k: AverageMeter() for k in ("q", "v", "pi")}
+        for batch in tqdm(train_dl, desc=f"Epoch {ep} [train]"):
             stats = agent.update(batch)
-            for k, v in stats.items(): meters[k].update(v, n=batch[0].size(0))
-        print(" | ".join([f"{k}:{m.avg:.4f}" for k, m in meters.items()]))
+            for k, v in stats.items():
+                train_m[k].update(v, n=batch[0].size(0))
+                writer.add_scalar(f"train/{k}_loss", v, step)
+            step += 1
+
+        val_stats = {k: AverageMeter() for k in ("q", "v", "pi")}
+        for batch in tqdm(val_dl, desc=f"Epoch {ep} [val]"):
+            losses = agent.compute_losses(batch)
+            for k, v in losses.items():
+                val_stats[k].update(v, n=batch[0].size(0))
+        for k in val_stats:
+            writer.add_scalar(f"val/{k}_loss", val_stats[k].avg, ep)
+
+        train_msg = " ".join([f"{k}:{m.avg:.4f}" for k, m in train_m.items()])
+        val_msg = " ".join([f"val_{k}:{val_stats[k].avg:.4f}" for k in val_stats])
+        print(train_msg + " | " + val_msg)
+
+    writer.close()
 
     os.makedirs(cfg.out_dir, exist_ok=True)
     ckpt = Path(cfg.out_dir) / "checkpoint.pt"
