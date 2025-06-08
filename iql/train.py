@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
-from torchvision import transforms
+from torchvision import transforms, models
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
@@ -70,7 +70,7 @@ class LerobotDataset(Dataset):
     def __init__(
         self,
         root: str | Path,
-        image_size: int = 128,
+        image_size: int = 128,  # deprecated, kept for backwards compatibility
         qvel_dim: int = 3,
         text_model: str = "all-MiniLM-L6-v2",
     ):
@@ -112,10 +112,21 @@ class LerobotDataset(Dataset):
             emb = self.text_encoder.encode(prompt, convert_to_numpy=True)
             self.prompt_cache[idx] = torch.from_numpy(emb.astype(np.float32))
 
-        # Image transform
+        # Vision backbone (frozen ResNet‑50)
+        self.backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.backbone.fc = nn.Identity()
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        # Image transform -- keep 360x640 resolution and normalize
         self.img_tf = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize((360, 640)),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
         ])
 
         # Working cache: keep last loaded file as pandas DF to avoid thrashing
@@ -145,11 +156,13 @@ class LerobotDataset(Dataset):
         file_idx, row_idx = self.index[global_idx]
         row = self._get_row(file_idx, row_idx)
 
-        # Decode image
+        # Decode image and compute visual embedding
         img_bytes = row["observation.images.perspective"]
         img_np = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
         img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
         img = self.img_tf(img_rgb)
+        with torch.no_grad():
+            img_feat = self.backbone(img.unsqueeze(0)).squeeze(0)
 
         # Q velocity state
         qvel_full = row["observation.state"]  # list-like length ≥ qvel_dim
@@ -169,7 +182,7 @@ class LerobotDataset(Dataset):
         prompt_emb = self.prompt_cache[task_idx]
 
         # Current observation vector
-        obs = torch.cat([img.flatten(), qvel, prompt_emb], dim=0)
+        obs = torch.cat([img_feat, qvel, prompt_emb], dim=0)
 
         # Next observation (t+1)
         if done_flag or row_idx + 1 >= self.file_meta[file_idx][1]:
@@ -180,8 +193,14 @@ class LerobotDataset(Dataset):
             nxt_np = cv2.imdecode(np.frombuffer(nxt_img_bytes, np.uint8), cv2.IMREAD_COLOR)
             nxt_rgb = cv2.cvtColor(nxt_np, cv2.COLOR_BGR2RGB)
             nxt_img = self.img_tf(nxt_rgb)
-            nxt_qvel = torch.from_numpy(np.array(next_row["observation.state"][: self.qvel_dim], dtype=np.float32, copy=True))
-            next_obs = torch.cat([nxt_img.flatten(), nxt_qvel, prompt_emb], dim=0)
+
+    
+        with torch.no_grad():
+            nxt_feat = self.backbone(nxt_img.unsqueeze(0)).squeeze(0)
+
+        nxt_qvel_np = np.array(next_row["observation.state"][: self.qvel_dim], dtype=np.float32, copy=True)
+        nxt_qvel = torch.from_numpy(nxt_qvel_np)
+        next_obs = torch.cat([nxt_feat, nxt_qvel, prompt_emb], dim=0)
 
         return obs, act, rew, next_obs, done
 
