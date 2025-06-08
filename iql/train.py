@@ -22,6 +22,25 @@ from torchvision import transforms
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a simple IQL agent")
+    parser.add_argument("--data-root", type=str, required=True, help="Path to dataset root")
+    parser.add_argument("--out-dir", type=str, default="runs/iql", help="Output directory for checkpoints")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument("--qvel-dim", type=int, default=3)
+    parser.add_argument("--text-model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--hidden", type=int, default=1024)
+    parser.add_argument("--expectile", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=3.0)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
+
 # Helpers
 
 class AverageMeter:
@@ -136,7 +155,7 @@ class LerobotDataset(Dataset):
         done = torch.as_tensor(float(done_flag))
 
         # Prompt embedding
-        task_idx = int(row["task_index"]) if "task_index" in row else 0
+        task_idx = int(row["task_index"][0]) if "task_index" in row else 0
         prompt_emb = self.prompt_cache[task_idx]
 
         # Current observation vector
@@ -236,6 +255,11 @@ class IQLAgent:
         for tgt, src in zip(self.tq2.parameters(), self.q2.parameters()):
             tgt.data.mul_(1 - tau).add_(tau * src.data)
 
+    def _soft_update(self, target: nn.Module, source: nn.Module, tau: float) -> None:
+        """Soft-update target network parameters."""
+        for tgt, src in zip(target.parameters(), source.parameters()):
+            tgt.data.mul_(1 - tau).add_(tau * src.data)
+
     def _expectile_loss(self, diff):
         w = torch.where(diff > 0, self.expectile, 1 - self.expectile)
         return (w * diff.pow(2)).mean()
@@ -257,7 +281,7 @@ class IQLAgent:
             q_min = torch.minimum(q1_pred, q2_pred)
         v_pred = self.v(obs)
         v_loss = self._expectile_loss(q_min - v_pred)
-        self.opt_v.zero_grad(); v_loss
+        self.opt_v.zero_grad(); v_loss.backward(); self.opt_v.step()
 
         # Policy update (adv‑weighted BC)
         with torch.no_grad():
@@ -306,7 +330,21 @@ def train(cfg):
         print(" | ".join([f"{k}:{m.avg:.4f}" for k, m in meters.items()]))
 
     os.makedirs(cfg.out_dir, exist_ok=True)
-    torch.save({
-        "policy": agent.pi.state_dict(),
-        "q1": agent.q1.state
+    ckpt = Path(cfg.out_dir) / "checkpoint.pt"
+    torch.save(
+        {
+            "policy": agent.pi.state_dict(),
+            "q1": agent.q1.state_dict(),
+            "q2": agent.q2.state_dict(),
+            "v": agent.v.state_dict(),
+            "cfg": vars(cfg),
+        },
+        ckpt,
+    )
+    print(f"Saved checkpoint to {ckpt}")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    train(args)
 
