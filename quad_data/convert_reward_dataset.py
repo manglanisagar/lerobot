@@ -135,7 +135,8 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
         action = [cmd_row["vx"], cmd_row["vy"], cmd_row["omega"]]
 
         done = i == success_idx
-        reward = 1.0 if done else -0.001 - 0.001 * (cmd_row["vx"] + cmd_row["vy"] + cmd_row["omega"])
+        effort = abs(cmd_row["vx"]) + abs(cmd_row["vy"]) + abs(cmd_row["omega"])
+        reward = 10.0 if done else -0.01 - 0.01 * effort
 
         episode_data["observation.state"].append(state)
         episode_data["action"].append(action)

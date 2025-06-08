@@ -30,17 +30,18 @@ def parse_args():
     parser.add_argument("--data-root", type=str, required=True, help="Path to dataset root")
     parser.add_argument("--out-dir", type=str, default="runs/iql", help="Output directory for checkpoints")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--qvel-dim", type=int, default=3)
     parser.add_argument("--text-model", type=str, default="all-MiniLM-L6-v2")
     parser.add_argument("--hidden", type=int, default=1024)
-    parser.add_argument("--expectile", type=float, default=0.7)
+    parser.add_argument("--expectile", type=float, default=0.3)
     parser.add_argument("--temperature", type=float, default=3.0)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     return parser.parse_args()
 
 # Helpers
@@ -298,11 +299,13 @@ class IQLAgent:
         w = torch.where(diff > 0, self.expectile, 1 - self.expectile)
         return (w * diff.pow(2)).mean()
 
-    def compute_losses(self, batch):
+    def compute_losses(self, batch, ep):
         with torch.no_grad():
             obs, act, rew, next_obs, done = [b.to(self.device) for b in batch]
             target_v = self.v(next_obs)
             target_q = rew + self.gamma * (1 - done) * target_v
+            margin = 0 #max(0.05 * (1 - ep / 20), 0.0)
+            target_q += margin
 
             q1_pred, q2_pred = self.q1(obs, act), self.q2(obs, act)
             q_loss = (q1_pred - target_q).pow(2).mean() + (q2_pred - target_q).pow(2).mean()
@@ -312,7 +315,7 @@ class IQLAgent:
             v_loss = self._expectile_loss(q_min - v_pred)
 
             adv = q_min - v_pred
-            weights = torch.exp(adv / self.temperature).clamp(max=100.0)
+            weights = torch.exp(adv / self.temperature).clamp(max=10.0)
             mu, std = self.pi(obs)
             dist = torch.distributions.Normal(mu, std)
             log_prob = dist.log_prob(act).sum(-1)
@@ -336,7 +339,9 @@ class IQLAgent:
         with torch.no_grad():
             q_min = torch.minimum(q1_pred, q2_pred)
         v_pred = self.v(obs)
-        v_loss = self._expectile_loss(q_min - v_pred)
+        diff = q_min - v_pred
+        v_loss = self._expectile_loss(diff)
+        # print(f"[DEBUG] q_min.mean: {q_min.mean():.4f}, v_pred.mean: {v_pred.mean():.4f}, diff.mean: {diff.mean():.4f}")
         self.opt_v.zero_grad(); v_loss.backward(); self.opt_v.step()
 
         # Policy update (adv‑weighted BC)
@@ -360,7 +365,7 @@ class IQLAgent:
 def train(cfg):
     print(f"[INFO] Using device: {cfg.device}")
 
-    # ---------- dataset & loader ----------
+    # dataset
     ds = LerobotDataset(cfg.data_root,
                         image_size=cfg.image_size,
                         qvel_dim=cfg.qvel_dim,
@@ -372,12 +377,12 @@ def train(cfg):
 
     train_dl = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True,
                           num_workers=cfg.workers, pin_memory=True,
-                          persistent_workers=True, prefetch_factor=4)
+                          persistent_workers=False, prefetch_factor=4)
     val_dl   = DataLoader(val_ds,   batch_size=cfg.batch, shuffle=False,
                           num_workers=cfg.workers, pin_memory=True,
-                          persistent_workers=True)
+                          persistent_workers=False)
 
-    # ---------- frozen batched backbone on GPU ----------
+    # frozen batched backbone on GPU
     backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
     backbone.fc = nn.Identity()
     backbone.eval()
@@ -385,7 +390,6 @@ def train(cfg):
     for p in backbone.parameters():
         p.requires_grad = False
 
-    # ---------- dimensions ----------
     feat_dim   = backbone(
         torch.zeros(1, 3, 360, 640, device=cfg.device)).shape[1]
     prompt_dim = next(iter(ds.prompt_cache.values())).numel()
@@ -401,11 +405,28 @@ def train(cfg):
                      device=cfg.device)
 
     writer, step = SummaryWriter(cfg.out_dir), 0
+    
+    start_epoch = 1
 
-    for ep in range(1, cfg.epochs + 1):
+    if cfg.resume:
+        checkpoint = torch.load(cfg.resume, map_location=cfg.device)
+        agent.pi.load_state_dict(checkpoint["policy"])
+        agent.q1.load_state_dict(checkpoint["q1"])
+        agent.q2.load_state_dict(checkpoint["q2"])
+        agent.v.load_state_dict(checkpoint["v"])
+        agent.opt_pi.load_state_dict(checkpoint["opt_pi"])
+        agent.opt_q.load_state_dict(checkpoint["opt_q"])
+        agent.opt_v.load_state_dict(checkpoint["opt_v"])
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        step = checkpoint.get("step", 0)
+        print(f"[INFO] Resumed from {cfg.resume} at epoch {start_epoch}")
+    else:
+        step = 0
+
+    for ep in range(start_epoch, cfg.epochs + 1):
         meters = {k: AverageMeter() for k in ("q", "v", "pi")}
 
-        # -------- TRAIN --------
+        # train
         for batch in tqdm(train_dl, desc=f"Epoch {ep} [train]"):
             (img, qvel, prompt, act, rew, done,
              nxt_img, nxt_qvel) = [b.to(cfg.device, non_blocking=True)
@@ -424,7 +445,7 @@ def train(cfg):
                 writer.add_scalar(f"train/{k}_loss", v, step)
             step += 1
 
-        # -------- VALIDATION --------
+        # val
         val_m = {k: AverageMeter() for k in ("q", "v", "pi")}
         with torch.no_grad():
             for batch in tqdm(val_dl, desc=f"Epoch {ep} [val]"):
@@ -437,26 +458,33 @@ def train(cfg):
                 obs   = torch.cat([feat,  qvel, prompt], dim=1)
                 nobs  = torch.cat([nfeat, nxt_qvel, prompt], dim=1)
 
-                losses = agent.compute_losses([obs, act, rew, nobs, done])
+                losses = agent.compute_losses([obs, act, rew, nobs, done], ep)
                 for k, v in losses.items():
                     val_m[k].update(v, n=img.size(0))
 
-        # -------- logging --------
+        # log
         tmsg = " ".join(f"{k}:{m.avg:.4f}" for k, m in meters.items())
         vmsg = " ".join(f"val_{k}:{val_m[k].avg:.4f}" for k in val_m)
         print(tmsg, "|", vmsg)
         for k in val_m:
             writer.add_scalar(f"val/{k}_loss", val_m[k].avg, ep)
 
-    writer.close()
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    torch.save({
-        "policy": agent.pi.state_dict(),
-        "q1": agent.q1.state_dict(),
-        "q2": agent.q2.state_dict(),
-        "v": agent.v.state_dict(),
-        "cfg": vars(cfg),
-    }, Path(cfg.out_dir) / "checkpoint.pt")
+        # Checkpoint every 5 epochs
+        if ep % 5 == 0:
+            ckpt_path = Path(cfg.out_dir) / f"epoch_{ep:03d}.pt"
+            torch.save({
+                "epoch": ep,
+                "step": step,
+                "policy": agent.pi.state_dict(),
+                "q1": agent.q1.state_dict(),
+                "q2": agent.q2.state_dict(),
+                "v": agent.v.state_dict(),
+                "opt_pi": agent.opt_pi.state_dict(),
+                "opt_q": agent.opt_q.state_dict(),
+                "opt_v": agent.opt_v.state_dict(),
+                "cfg": vars(cfg),
+            }, ckpt_path)
+            print(f"[INFO] Saved checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":
