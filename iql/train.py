@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=3.0)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -139,6 +139,8 @@ class LerobotDataset(Dataset):
 
     def _load_file(self, file_idx: int):
         path = self.file_meta[file_idx][0]
+        if self._curr_df is not None:
+            del self._curr_df
         self._curr_df = pq.read_table(path).to_pandas()
         self._curr_file_idx = file_idx
 
@@ -152,57 +154,60 @@ class LerobotDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
+    # PyTorch Dataset interface
     def __getitem__(self, global_idx):
+        """
+        Returns
+        -------
+        img          : torch.FloatTensor (3,360,640)
+        qvel         : torch.FloatTensor (qvel_dim,)
+        prompt_emb   : torch.FloatTensor (384,)  – cached ST embedding
+        act          : torch.FloatTensor (act_dim,)
+        rew          : torch.FloatTensor ()      – scalar
+        done         : torch.FloatTensor ()      – scalar 0/1
+        nxt_img      : torch.FloatTensor (3,360,640)   (zeros if done)
+        nxt_qvel     : torch.FloatTensor (qvel_dim,)   (zeros if done)
+        """
         file_idx, row_idx = self.index[global_idx]
         row = self._get_row(file_idx, row_idx)
 
-        # Decode image and compute visual embedding
+        # ---------- current image ----------
         img_bytes = row["observation.images.perspective"]
-        img_np = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        img_np = cv2.imdecode(np.frombuffer(img_bytes, np.uint8),
+                              cv2.IMREAD_COLOR)
         img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-        img = self.img_tf(img_rgb)
-        with torch.no_grad():
-            img_feat = self.backbone(img.unsqueeze(0)).squeeze(0)
+        img      = self.img_tf(img_rgb)           # (3,360,640)
 
-        # Q velocity state
-        qvel_full = row["observation.state"]  # list-like length ≥ qvel_dim
-        qvel_np = np.array(qvel_full[: self.qvel_dim], dtype=np.float32, copy=True)
-        qvel = torch.from_numpy(qvel_np)
+        # ---------- proprio ----------
+        qvel = torch.tensor(np.array(row["observation.state"][:self.qvel_dim],
+                                    dtype=np.float32, copy=True))
 
-        # Action
-        act = torch.from_numpy(np.array(row["action"], dtype=np.float32, copy=True))
-
-        # Reward & done
-        rew = torch.as_tensor(row["next.reward"][0], dtype=torch.float32)
+        # ---------- action / reward / done ----------
+        act = torch.tensor(np.array(row["action"], dtype=np.float32, copy=True))
+        rew  = torch.as_tensor(row["next.reward"][0], dtype=torch.float32)
         done_flag = bool(row["next.done"][0])
         done = torch.as_tensor(float(done_flag))
 
-        # Prompt embedding
+        # ---------- prompt embedding ----------
         task_idx = int(row["task_index"][0]) if "task_index" in row else 0
         prompt_emb = self.prompt_cache[task_idx]
 
-        # Current observation vector
-        obs = torch.cat([img_feat, qvel, prompt_emb], dim=0)
-
-        # Next observation (t+1)
+        # ---------- next-step tensors ----------
         if done_flag or row_idx + 1 >= self.file_meta[file_idx][1]:
-            next_obs = torch.zeros_like(obs)
+            nxt_img  = torch.zeros_like(img)
+            nxt_qvel = torch.zeros_like(qvel)
         else:
-            next_row = self._get_row(file_idx, row_idx + 1)
-            nxt_img_bytes = next_row["observation.images.perspective"]
-            nxt_np = cv2.imdecode(np.frombuffer(nxt_img_bytes, np.uint8), cv2.IMREAD_COLOR)
-            nxt_rgb = cv2.cvtColor(nxt_np, cv2.COLOR_BGR2RGB)
-            nxt_img = self.img_tf(nxt_rgb)
+            nxt_row  = self._get_row(file_idx, row_idx + 1)
+            nxt_b    = nxt_row["observation.images.perspective"]
+            nxt_np   = cv2.imdecode(np.frombuffer(nxt_b, np.uint8),
+                                    cv2.IMREAD_COLOR)
+            nxt_rgb  = cv2.cvtColor(nxt_np, cv2.COLOR_BGR2RGB)
+            nxt_img  = self.img_tf(nxt_rgb)
+            nxt_qvel = torch.tensor(np.array(
+                nxt_row["observation.state"][:self.qvel_dim],
+                dtype=np.float32, copy=True))
 
-    
-        with torch.no_grad():
-            nxt_feat = self.backbone(nxt_img.unsqueeze(0)).squeeze(0)
-
-        nxt_qvel_np = np.array(next_row["observation.state"][: self.qvel_dim], dtype=np.float32, copy=True)
-        nxt_qvel = torch.from_numpy(nxt_qvel_np)
-        next_obs = torch.cat([nxt_feat, nxt_qvel, prompt_emb], dim=0)
-
-        return obs, act, rew, next_obs, done
+        return img, qvel, prompt_emb, act, rew, done, nxt_img, nxt_qvel
 
 # Networks
 
@@ -353,70 +358,105 @@ class IQLAgent:
 # Training loop 
 
 def train(cfg):
-    ds = LerobotDataset(
-        cfg.data_root,
-        image_size=cfg.image_size,
-        qvel_dim=cfg.qvel_dim,
-        text_model=cfg.text_model,
-    )
+    print(f"[INFO] Using device: {cfg.device}")
 
-    val_len = max(1, int(0.1 * len(ds)))
+    # ---------- dataset & loader ----------
+    ds = LerobotDataset(cfg.data_root,
+                        image_size=cfg.image_size,
+                        qvel_dim=cfg.qvel_dim,
+                        text_model=cfg.text_model)
+
+    val_len   = max(1, int(0.1 * len(ds)))
     train_len = len(ds) - val_len
     train_ds, val_ds = random_split(ds, [train_len, val_len])
 
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=cfg.batch, shuffle=False, num_workers=cfg.workers, pin_memory=True)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True,
+                          num_workers=cfg.workers, pin_memory=True,
+                          persistent_workers=True, prefetch_factor=4)
+    val_dl   = DataLoader(val_ds,   batch_size=cfg.batch, shuffle=False,
+                          num_workers=cfg.workers, pin_memory=True,
+                          persistent_workers=True)
 
-    obs_dim = ds[0][0].numel()
-    act_dim = ds[0][1].numel()
-    agent = IQLAgent(
-        obs_dim, act_dim,
-        hidden=cfg.hidden,
-        expectile=cfg.expectile,
-        temperature=cfg.temperature,
-        gamma=cfg.gamma,
-        lr=cfg.lr,
-        device=cfg.device,
-    )
+    # ---------- frozen batched backbone on GPU ----------
+    backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    backbone.fc = nn.Identity()
+    backbone.eval()
+    backbone.to(cfg.device)
+    for p in backbone.parameters():
+        p.requires_grad = False
 
-    writer = SummaryWriter(cfg.out_dir)
-    step = 0
+    # ---------- dimensions ----------
+    feat_dim   = backbone(
+        torch.zeros(1, 3, 360, 640, device=cfg.device)).shape[1]
+    prompt_dim = next(iter(ds.prompt_cache.values())).numel()
+    obs_dim    = feat_dim + cfg.qvel_dim + prompt_dim
+    act_dim    = ds[0][3].numel()
+
+    agent = IQLAgent(obs_dim, act_dim,
+                     hidden=cfg.hidden,
+                     expectile=cfg.expectile,
+                     temperature=cfg.temperature,
+                     gamma=cfg.gamma,
+                     lr=cfg.lr,
+                     device=cfg.device)
+
+    writer, step = SummaryWriter(cfg.out_dir), 0
+
     for ep in range(1, cfg.epochs + 1):
-        train_m = {k: AverageMeter() for k in ("q", "v", "pi")}
+        meters = {k: AverageMeter() for k in ("q", "v", "pi")}
+
+        # -------- TRAIN --------
         for batch in tqdm(train_dl, desc=f"Epoch {ep} [train]"):
-            stats = agent.update(batch)
+            (img, qvel, prompt, act, rew, done,
+             nxt_img, nxt_qvel) = [b.to(cfg.device, non_blocking=True)
+                                   for b in batch]
+
+            with torch.no_grad():
+                feat  = backbone(img)       # (B,2048)
+                nfeat = backbone(nxt_img)
+
+            obs      = torch.cat([feat,  qvel, prompt], dim=1)
+            next_obs = torch.cat([nfeat, nxt_qvel, prompt], dim=1)
+
+            stats = agent.update([obs, act, rew, next_obs, done])
             for k, v in stats.items():
-                train_m[k].update(v, n=batch[0].size(0))
+                meters[k].update(v, n=img.size(0))
                 writer.add_scalar(f"train/{k}_loss", v, step)
             step += 1
 
-        val_stats = {k: AverageMeter() for k in ("q", "v", "pi")}
-        for batch in tqdm(val_dl, desc=f"Epoch {ep} [val]"):
-            losses = agent.compute_losses(batch)
-            for k, v in losses.items():
-                val_stats[k].update(v, n=batch[0].size(0))
-        for k in val_stats:
-            writer.add_scalar(f"val/{k}_loss", val_stats[k].avg, ep)
+        # -------- VALIDATION --------
+        val_m = {k: AverageMeter() for k in ("q", "v", "pi")}
+        with torch.no_grad():
+            for batch in tqdm(val_dl, desc=f"Epoch {ep} [val]"):
+                (img, qvel, prompt, act, rew, done,
+                 nxt_img, nxt_qvel) = [b.to(cfg.device, non_blocking=True)
+                                       for b in batch]
 
-        train_msg = " ".join([f"{k}:{m.avg:.4f}" for k, m in train_m.items()])
-        val_msg = " ".join([f"val_{k}:{val_stats[k].avg:.4f}" for k in val_stats])
-        print(train_msg + " | " + val_msg)
+                feat  = backbone(img)
+                nfeat = backbone(nxt_img)
+                obs   = torch.cat([feat,  qvel, prompt], dim=1)
+                nobs  = torch.cat([nfeat, nxt_qvel, prompt], dim=1)
+
+                losses = agent.compute_losses([obs, act, rew, nobs, done])
+                for k, v in losses.items():
+                    val_m[k].update(v, n=img.size(0))
+
+        # -------- logging --------
+        tmsg = " ".join(f"{k}:{m.avg:.4f}" for k, m in meters.items())
+        vmsg = " ".join(f"val_{k}:{val_m[k].avg:.4f}" for k in val_m)
+        print(tmsg, "|", vmsg)
+        for k in val_m:
+            writer.add_scalar(f"val/{k}_loss", val_m[k].avg, ep)
 
     writer.close()
-
     os.makedirs(cfg.out_dir, exist_ok=True)
-    ckpt = Path(cfg.out_dir) / "checkpoint.pt"
-    torch.save(
-        {
-            "policy": agent.pi.state_dict(),
-            "q1": agent.q1.state_dict(),
-            "q2": agent.q2.state_dict(),
-            "v": agent.v.state_dict(),
-            "cfg": vars(cfg),
-        },
-        ckpt,
-    )
-    print(f"Saved checkpoint to {ckpt}")
+    torch.save({
+        "policy": agent.pi.state_dict(),
+        "q1": agent.q1.state_dict(),
+        "q2": agent.q2.state_dict(),
+        "v": agent.v.state_dict(),
+        "cfg": vars(cfg),
+    }, Path(cfg.out_dir) / "checkpoint.pt")
 
 
 if __name__ == "__main__":
