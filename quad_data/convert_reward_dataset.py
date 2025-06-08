@@ -22,7 +22,7 @@ from lerobot.common.datasets.utils import (
 )
 
 INPUT_DIR = "dataset"
-OUTPUT_DIR = "processed_dataset"
+OUTPUT_DIR = "reward_dataset"
 PROMPTS_FILE = os.path.join(INPUT_DIR, "prompts.csv")
 IMAGE_SIZE = (640, 360)  # width, height
 IGNORE_FRAMES = 50
@@ -131,11 +131,11 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
         obs_row = vel_df.iloc[i]
         cmd_row = cmd_df.iloc[i]
 
-        state = [obs_row["vx"], obs_row["vy"], obs_row["yaw"]]
+        state = [obs_row["vx"], obs_row["vy"], obs_row["wz"]]
         action = [cmd_row["vx"], cmd_row["vy"], cmd_row["omega"]]
 
         done = i == success_idx
-        reward = 1.0 if done else -0.001 - 0.001 * (cmd_row["vx"] + cmd_row["vy"] + obs_row["wz"])
+        reward = 1.0 if done else -0.001 - 0.001 * (cmd_row["vx"] + cmd_row["vy"] + cmd_row["omega"])
 
         episode_data["observation.state"].append(state)
         episode_data["action"].append(action)
@@ -166,16 +166,8 @@ for scene in tqdm(sorted(os.listdir(INPUT_DIR))):
     }
 
     ep_stats = {
-        key: get_feature_stats(
-            value,
-            axis=(0, 2, 3) if key == "observation.images.perspective" else 0,
-            keepdims=key == "observation.images.perspective",
-        )
+        key: get_feature_stats(value, axis=0, keepdims=False)
         for key, value in ep_stats_buffer.items()
-    }
-    ep_stats["observation.images.perspective"] = {
-        k: v if k == "count" else np.squeeze(v, axis=0)
-        for k, v in ep_stats["observation.images.perspective"].items()
     }
 
     table = pa.Table.from_pydict(episode_data)
