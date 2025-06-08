@@ -17,6 +17,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import io
 from collections.abc import Iterator
 from itertools import accumulate
 from pathlib import Path
@@ -266,6 +267,9 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
         if isinstance(first_item, PILImage.Image):
             to_tensor = transforms.ToTensor()
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+        elif isinstance(first_item, (bytes, bytearray)):
+            to_tensor = transforms.ToTensor()
+            items_dict[key] = [to_tensor(PILImage.open(io.BytesIO(img)).convert("RGB")) for img in items_dict[key]]
         elif first_item is None:
             pass
         else:
