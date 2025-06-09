@@ -4,7 +4,8 @@ from pathlib import Path
 import torch
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from lerobot.common.policies.factory import get_policy_class
+from lerobot.configs.policies import PreTrainedConfig
 
 
 def main():
@@ -13,16 +14,18 @@ def main():
     # Path to the trained policy
     pretrained_policy_path = Path("outputs/train/2025-06-07/22-27-35_smolvla/checkpoints/001000/pretrained_model")
 
-    policy = DiffusionPolicy.from_pretrained(pretrained_policy_path)
+    cfg = PreTrainedConfig.from_pretrained(pretrained_policy_path, local_files_only=True)
+    policy_cls = get_policy_class(cfg.type)
+    policy = policy_cls.from_pretrained(pretrained_policy_path, local_files_only=True)
     policy.eval()
     policy.to(device)
 
     # Setup dataset and split episodes
-    dataset_root = Path("quad_data")
-    repo_id = "processed_dataset"
+    dataset_root = Path("quad_data/processed_dataset")
+    repo_id = "quad_data/processed_dataset"
 
     delta_timestamps = {
-        "observation.image": [-0.1, 0.0],
+        "observation.images.perspective": [-0.1, 0.0],
         "observation.state": [-0.1, 0.0],
         "action": [
             -0.1,
@@ -49,7 +52,7 @@ def main():
     episodes = list(range(total_episodes))
     num_train_episodes = math.floor(total_episodes * 90 / 100)
     train_episodes = episodes[:num_train_episodes]
-    val_episodes = episodes[num_train_episodes:]
+    val_episodes = list(range(len(episodes[num_train_episodes:])))
     print(f"Number of episodes in full dataset: {total_episodes}")
     print(f"Number of episodes in training dataset (90% subset): {len(train_episodes)}")
     print(f"Number of episodes in validation dataset (10% subset): {len(val_episodes)}")
@@ -81,7 +84,12 @@ def main():
     loss_cumsum = 0
     n_examples_evaluated = 0
     for batch in val_dataloader:
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: (torch.stack(v).to(device, non_blocking=True) if isinstance(v, list) and isinstance(v[0], torch.Tensor)
+                else v.to(device, non_blocking=True) if isinstance(v, torch.Tensor)
+                else v)
+            for k, v in batch.items()
+        }
         loss, _ = policy.forward(batch)
 
         loss_cumsum += loss.item()
