@@ -3,9 +3,11 @@
 
 import argparse
 from typing import Dict, List
+from pathlib import Path
 
 import numpy as np
 import torch
+import json
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Subset
 from torchvision import models
@@ -18,7 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train an IQL agent with k-fold cross-validation")
     parser.add_argument("--data-root", type=str, required=True, help="Path to dataset root")
     parser.add_argument("--folds", type=int, default=5, help="Number of folds")
-    parser.add_argument("--epochs", type=int, default=50, help="Epochs per fold")
+    parser.add_argument("--epochs", type=int, default=30, help="Epochs per fold")
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--qvel-dim", type=int, default=3)
@@ -27,9 +29,10 @@ def parse_args():
     parser.add_argument("--expectile", type=float, default=0.3)
     parser.add_argument("--temperature", type=float, default=3.0)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--out-dir", type=str, default="runs/iql_kfold", help="Directory to save checkpoints")
     return parser.parse_args()
 
 
@@ -72,7 +75,9 @@ def compute_episode_metrics(ds: LerobotDataset, indices: List[int]) -> Dict[str,
     }
 
 
+
 def train_fold(cfg, fold, train_idx, val_idx, ds, backbone, obs_dim, act_dim):
+    print(f"\n[INFO] Starting Fold {fold}/{cfg.folds}")
     train_ds = Subset(ds, train_idx)
     val_ds = Subset(ds, sorted(val_idx))
 
@@ -137,13 +142,33 @@ def train_fold(cfg, fold, train_idx, val_idx, ds, backbone, obs_dim, act_dim):
             for k, v in losses.items():
                 val_m[k].update(v, n=img.size(0))
 
+    # Compute metrics
     metrics = {
         "q_loss": val_m["q"].avg,
         "v_loss": val_m["v"].avg,
         "pi_loss": val_m["pi"].avg,
     }
-    metrics.update(compute_episode_metrics(ds, val_idx))
+    metrics.update(compute_episode_metrics(ds, sorted(val_idx)))
 
+    # Save checkpoint
+    ckpt_dir = Path(cfg.out_dir) / f"fold_{fold}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / "final_model.pt"
+    torch.save({
+        "policy": agent.pi.state_dict(),
+        "q1": agent.q1.state_dict(),
+        "q2": agent.q2.state_dict(),
+        "v": agent.v.state_dict(),
+        "cfg": vars(cfg),
+        "fold": fold,
+    }, ckpt_path)
+    print(f"[INFO] Saved checkpoint: {ckpt_path}")
+
+    metrics_path = ckpt_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    # Print fold results
     print(f"Fold {fold} results:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
@@ -188,6 +213,10 @@ def main(cfg):
         mean = float(np.mean(vals))
         std = float(np.std(vals))
         print(f"{k}: {mean:.4f} ± {std:.4f}")
+    
+    summary_path = Path(cfg.out_dir) / "kfold_metrics.json"
+    with open(summary_path, "w") as f:
+        json.dump(all_metrics, f, indent=2)
 
 
 if __name__ == "__main__":
