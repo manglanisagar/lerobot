@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--expectile", type=float, default=0.3)
     parser.add_argument("--temperature", type=float, default=3.0)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lr", type=float, default=6e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=str, default="runs/iql_kfold", help="Directory to save checkpoints")
