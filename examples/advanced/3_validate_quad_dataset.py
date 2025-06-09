@@ -12,7 +12,7 @@ def main():
     device = torch.device("cuda")
 
     # Path to the trained policy
-    pretrained_policy_path = Path("outputs/train/2025-06-07/22-27-35_smolvla/checkpoints/001000/pretrained_model")
+    pretrained_policy_path = Path("outputs/train/2025-06-09/00-18-15_smolvla/checkpoints/005000/pretrained_model")
 
     cfg = PreTrainedConfig.from_pretrained(pretrained_policy_path, local_files_only=True)
     policy_cls = get_policy_class(cfg.type)
@@ -24,30 +24,18 @@ def main():
     dataset_root = Path("quad_data/processed_dataset")
     repo_id = "quad_data/processed_dataset"
 
+    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=dataset_root)
+    fps = dataset_metadata.fps
+
+    # Compute the delta timestamps expected by the policy. This ensures that the
+    # sequence length of the data matches what the model was trained with and
+    # avoids mismatches when constructing the attention masks.
     delta_timestamps = {
-        "observation.images.perspective": [-0.1, 0.0],
-        "observation.state": [-0.1, 0.0],
-        "action": [
-            -0.1,
-            0.0,
-            0.1,
-            0.2,
-            0.3,
-            0.4,
-            0.5,
-            0.6,
-            0.7,
-            0.8,
-            0.9,
-            1.0,
-            1.1,
-            1.2,
-            1.3,
-            1.4,
-        ],
+        "observation.images.perspective": [i / fps for i in cfg.observation_delta_indices],
+        "observation.state": [i / fps for i in cfg.observation_delta_indices],
+        "action": [i / fps for i in cfg.action_delta_indices],
     }
 
-    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=dataset_root)
     total_episodes = dataset_metadata.total_episodes
     episodes = list(range(total_episodes))
     num_train_episodes = math.floor(total_episodes * 90 / 100)
