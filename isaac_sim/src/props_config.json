@@ -1,0 +1,17 @@
+[
+  {
+    "path": "/Isaac/Props/YCB/Axis_Aligned/011_banana.usd",
+    "translation": [3.0, -1.5, 0.15],
+    "rotation": [-90.0, 0.0, 90.0]
+  },
+  {
+    "path": "/Isaac/Props/YCB/Axis_Aligned/002_master_chef_can.usd",
+    "translation": [3.0, 0, 0.15],
+    "rotation": [-90.0, 0.0, 90.0]
+  },
+  {
+    "path": "/Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd",
+    "translation": [3.0, 1.5, 0.15],
+    "rotation": [-90.0, 0.0, 90.0]
+  }
+]
